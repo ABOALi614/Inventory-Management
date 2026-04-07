@@ -1,0 +1,158 @@
+// WMS — ledger is source of truth; StockPosition is cached balance + optimistic version.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum StockMovementType {
+  INBOUND
+  OUTBOUND
+  ADJUSTMENT_IN
+  ADJUSTMENT_OUT
+  TRANSFER_OUT
+  TRANSFER_IN
+}
+
+enum LedgerReferenceKind {
+  PURCHASE_ORDER
+  SALES_ORDER
+  ADJUSTMENT
+  TRANSFER
+  MANUAL
+}
+
+enum UserRole {
+  ADMIN
+  MANAGER
+  PICKER
+}
+
+enum InvoiceStatus {
+  PENDING
+  COMPLETED
+  FAILED
+}
+
+model User {
+  id           String   @id @default(uuid())
+  email        String   @unique
+  passwordHash String   @map("password_hash")
+  role         UserRole @default(PICKER)
+  isActive     Boolean  @default(true) @map("is_active")
+  createdAt    DateTime @default(now()) @map("created_at")
+  updatedAt    DateTime @updatedAt @map("updated_at")
+
+  ledgerEntries StockLedgerEntry[]
+}
+
+model Warehouse {
+  id        String   @id @default(uuid())
+  code      String   @unique
+  name      String
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  locations     Location[]
+  ledgerEntries StockLedgerEntry[]
+}
+
+model Location {
+  id          String   @id @default(uuid())
+  warehouseId String   @map("warehouse_id")
+  code        String
+  name        String?
+  createdAt   DateTime @default(now()) @map("created_at")
+  updatedAt   DateTime @updatedAt @map("updated_at")
+
+  warehouse      Warehouse       @relation(fields: [warehouseId], references: [id], onDelete: Cascade)
+  stockPositions StockPosition[]
+  ledgerEntries  StockLedgerEntry[]
+
+  @@unique([warehouseId, code])
+  @@index([warehouseId])
+}
+
+model Product {
+  id          String   @id @default(uuid())
+  sku         String   @unique
+  name        String
+  description String?
+  isActive    Boolean  @default(true) @map("is_active")
+  createdAt   DateTime @default(now()) @map("created_at")
+  updatedAt   DateTime @updatedAt @map("updated_at")
+
+  stockPositions StockPosition[]
+  ledgerEntries  StockLedgerEntry[]
+
+  @@index([sku])
+}
+
+/// Cached quantity; updated only in the same transaction as new ledger rows.
+model StockPosition {
+  id             String  @id @default(uuid())
+  productId      String  @map("product_id")
+  locationId     String  @map("location_id")
+  quantityOnHand Decimal @default(0) @map("quantity_on_hand") @db.Decimal(18, 4)
+  version        Int     @default(0)
+  createdAt      DateTime @default(now()) @map("created_at")
+  updatedAt      DateTime @updatedAt @map("updated_at")
+
+  product  Product  @relation(fields: [productId], references: [id], onDelete: Restrict)
+  location Location @relation(fields: [locationId], references: [id], onDelete: Restrict)
+
+  @@unique([productId, locationId])
+  @@index([productId])
+  @@index([locationId])
+}
+
+/// Immutable stock movement record (append-only).
+model StockLedgerEntry {
+  id             String              @id @default(uuid())
+  productId      String              @map("product_id")
+  locationId     String              @map("location_id")
+  warehouseId    String              @map("warehouse_id")
+  movementType   StockMovementType   @map("movement_type")
+  quantityDelta  Decimal             @map("quantity_delta") @db.Decimal(18, 4)
+  referenceKind  LedgerReferenceKind @map("reference_kind")
+  referenceId    String?             @map("reference_id")
+  correlationId  String?             @map("correlation_id")
+  occurredAt     DateTime            @default(now()) @map("occurred_at")
+  idempotencyKey String?             @unique @map("idempotency_key")
+  metadata            Json?
+  createdAt           DateTime            @default(now()) @map("created_at")
+  performedByUserId   String?             @map("performed_by_user_id")
+
+  product     Product   @relation(fields: [productId], references: [id], onDelete: Restrict)
+  location    Location  @relation(fields: [locationId], references: [id], onDelete: Restrict)
+  warehouse   Warehouse @relation(fields: [warehouseId], references: [id], onDelete: Restrict)
+  performedBy User?     @relation(fields: [performedByUserId], references: [id], onDelete: SetNull)
+
+  @@index([productId, occurredAt(sort: Desc)])
+  @@index([locationId, occurredAt(sort: Desc)])
+  @@index([warehouseId, occurredAt(sort: Desc)])
+  @@index([correlationId])
+  @@index([performedByUserId])
+
+  invoices Invoice[]
+}
+
+/// Digital receipt generated asynchronously for outbound ledger lines.
+model Invoice {
+  id            String        @id @default(uuid())
+  ledgerEntryId String        @unique @map("ledger_entry_id")
+  status        InvoiceStatus @default(PENDING)
+  receiptPath   String?       @map("receipt_path")
+  receiptText   String?       @map("receipt_text") @db.Text
+  errorMessage  String?       @map("error_message") @db.Text
+  createdAt     DateTime      @default(now()) @map("created_at")
+  updatedAt     DateTime      @updatedAt @map("updated_at")
+
+  ledgerEntry StockLedgerEntry @relation(fields: [ledgerEntryId], references: [id], onDelete: Restrict)
+
+  @@index([status])
+}
